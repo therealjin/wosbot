@@ -1,0 +1,32 @@
+name: Sync Fork
+
+on:
+  schedule:
+    - cron: '0 0 * * 1'  # Weekly sync (every Monday at midnight)
+  workflow_dispatch:      # Manual trigger option
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write    # Required to push to the repository
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Fetch all history
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Add upstream repository
+        run: |
+          git remote add upstream https://github.com/whiteout-project/bot
+          git fetch upstream
+      - name: Merge upstream changes
+        run: |
+          git config --global user.name "GitHub Actions"
+          git config --global user.email "actions@github.com"
+          git checkout main
+          git merge --no-edit upstream/main
+      - name: Push changes
+        run: git push origin main
