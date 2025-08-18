@@ -88,11 +88,26 @@ except ImportError:
         print("Please install requests manually: pip install requests")
         sys.exit(1)
 
+def calculate_file_hash(filepath):
+    """Calculate SHA256 hash of a file."""
+    import hashlib
+    if not os.path.exists(filepath):
+        return None
+    
+    sha256_hash = hashlib.sha256()
+    try:
+        with open(filepath, "rb") as f:
+            for byte_block in iter(lambda: f.read(4096), b""):
+                sha256_hash.update(byte_block)
+        return sha256_hash.hexdigest()
+    except Exception:
+        return None
+
 # Configuration for multiple update sources
 UPDATE_SOURCES = [
     {
         "name": "GitHub",
-        "api_url": "https://api.github.com/repos/whiteout-project/bot/releases/latest",
+        "api_url": "https://api.github.com/repos/whiteout-project/bot-dev/releases/latest",
         "primary": True
     },
     {
@@ -104,22 +119,40 @@ UPDATE_SOURCES = [
     # Can add more sources here as needed
 ]
 
-def get_latest_release_info():
+def get_latest_release_info(beta_mode=False):
     """Try to get latest release info from multiple sources."""
     for source in UPDATE_SOURCES:
         try:
             print(f"Checking for updates from {source['name']}...")
             
             if source['name'] == "GitHub":
-                response = requests.get(source['api_url'], timeout=30)
-                if response.status_code == 200:
-                    data = response.json()
-                    return {
-                        "tag_name": data["tag_name"],
-                        "body": data["body"],
-                        "download_url": data["assets"][0]["browser_download_url"] if data["assets"] else None,
-                        "source": source['name']
-                    }
+                if beta_mode:
+                    # Get latest commit from main branch
+                    repo_name = source['api_url'].split('/repos/')[1].split('/releases')[0]
+                    branch_url = f"https://api.github.com/repos/{repo_name}/branches/main"
+                    response = requests.get(branch_url, timeout=30)
+                    if response.status_code == 200:
+                        data = response.json()
+                        commit_sha = data['commit']['sha'][:7]  # Short SHA
+                        return {
+                            "tag_name": f"beta-{commit_sha}",
+                            "body": f"Latest development version from main branch (commit: {commit_sha})",
+                            "download_url": f"https://github.com/{repo_name}/archive/refs/heads/main.zip",
+                            "source": f"{source['name']} (Beta)"
+                        }
+                else:
+                    response = requests.get(source['api_url'], timeout=30)
+                    if response.status_code == 200:
+                        data = response.json()
+                        # Use GitHub's automatic source archive
+                        repo_name = source['api_url'].split('/repos/')[1].split('/releases')[0]
+                        download_url = f"https://github.com/{repo_name}/archive/refs/tags/{data['tag_name']}.zip"
+                        return {
+                            "tag_name": data["tag_name"],
+                            "body": data["body"],
+                            "download_url": download_url,
+                            "source": source['name']
+                        }
                     
             elif source['name'] == "GitLab":
                 response = requests.get(source['api_url'], timeout=30)
@@ -127,10 +160,9 @@ def get_latest_release_info():
                     releases = response.json()
                     if releases:
                         latest = releases[0]  # GitLab returns array, first is latest
-                        # For GitLab, we use the generic packages API to get patch.zip
-                        project_id = source.get('project_id', 1)
                         tag_name = latest['tag_name']
-                        download_url = f"https://gitlab.whiteout-bot.com/api/v4/projects/{project_id}/packages/generic/release/{tag_name}/patch.zip"
+                        # Use GitLab's source archive
+                        download_url = f"https://gitlab.whiteout-bot.com/whiteout-project/bot/-/archive/{tag_name}/bot-{tag_name}.zip"
                         return {
                             "tag_name": tag_name,
                             "body": latest.get("description", "No release notes available"),
@@ -185,17 +217,11 @@ def ensure_requirements_file():
                     zip_ref.extract("requirements.txt", ".")
                     print("Successfully downloaded requirements.txt")
                     
-                    try:
-                        os.remove("temp_package.zip")
-                    except:
-                        pass
+                    safe_remove("temp_package.zip")
                     
                     return True
             
-            try:
-                os.remove("temp_package.zip")
-            except:
-                pass
+            safe_remove("temp_package.zip")
         
         print(f"Failed to download from {release_info['source']}")
         return False
@@ -253,7 +279,6 @@ def check_and_install_requirements():
             try:
                 cmd = [sys.executable, "-m", "pip", "install", package, "--no-cache-dir"]
                 
-                
                 subprocess.check_call(cmd, timeout=1200, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 print(f"✓ {package} installed successfully")
                 
@@ -296,8 +321,58 @@ except ImportError as e:
 
 import warnings
 import shutil
+import stat
 
-print("Removing unnecessary files...")
+def remove_readonly(func, path, _):
+    """Clear the readonly bit and reattempt the removal"""
+    os.chmod(path, stat.S_IWRITE)
+    func(path)
+
+def safe_remove(path, is_dir=None):
+    """
+    Safely remove a file or directory.
+    
+    Args:
+        path: Path to file or directory to remove
+        is_dir: True for directory, False for file, None to auto-detect
+        
+    Returns:
+        bool: True if successfully removed, False otherwise
+    """
+    if not os.path.exists(path):
+        return True  # Already gone, consider it success
+    
+    # Auto-detect type if not specified
+    if is_dir is None:
+        is_dir = os.path.isdir(path)
+    
+    try:
+        if is_dir:
+            # Directory removal with readonly handler (Windows only)
+            if sys.platform == "win32":
+                shutil.rmtree(path, onexc=remove_readonly)
+            else:
+                shutil.rmtree(path)
+        else:
+            # File removal with readonly bit clearing (Windows only)
+            try:
+                os.remove(path)
+            except PermissionError:
+                if sys.platform == "win32":
+                    # Try clearing readonly bit on Windows
+                    os.chmod(path, stat.S_IWRITE)
+                    os.remove(path)
+                else:
+                    raise  # Re-raise on non-Windows platforms
+        
+        return True
+        
+    except PermissionError:
+        print(f"Warning: Access Denied. Could not remove '{path}'. Check permissions or if {'directory' if is_dir else 'file'} is in use.")
+    except OSError as e:
+        print(f"Warning: Could not remove '{path}': {e}")
+    
+    return False
 
 try: # Clean up old ddddocr dependency if present
     try: # Try importlib.metadata approach first
@@ -326,36 +401,16 @@ except Exception as e:
     print(f"Warning: Error checking for ddddocr: {e}")
 
 v1_path = "V1oldbot"
-if os.path.exists(v1_path) and os.path.isdir(v1_path):
-    try:
-        shutil.rmtree(v1_path)
-        print(f"Removed directory: {v1_path}")
-    except PermissionError:
-        print(f"Warning: Access Denied. Could not remove legacy directory '{v1_path}'. Please check permissions or if files are in use, then remove manually if needed.")
-    except OSError as e:
-        print(f"Warning: Could not remove legacy directory '{v1_path}': {e}")
+if os.path.exists(v1_path) and safe_remove(v1_path):
+    print(f"Removed directory: {v1_path}")
 
 v2_path = "V2Old"
-if os.path.exists(v2_path) and os.path.isdir(v2_path):
-    try:
-        shutil.rmtree(v2_path)
-        print(f"Removed directory: {v2_path}")
-    except PermissionError:
-        print(f"Warning: Access Denied. Could not remove legacy directory '{v2_path}'. Please check permissions or if files are in use, then remove manually if needed.")
-    except OSError as e:
-        print(f"Warning: Could not remove legacy directory '{v2_path}': {e}")
+if os.path.exists(v2_path) and safe_remove(v2_path):
+    print(f"Removed directory: {v2_path}")
 
 txt_path = "autoupdateinfo.txt"
-if os.path.exists(txt_path) and os.path.isfile(txt_path): 
-    try:
-        os.remove(txt_path)
-        print(f"Removed file: {txt_path}")
-    except PermissionError:
-        print(f"Warning: Access Denied. Could not remove legacy file '{txt_path}'. Please check permissions or if the file is in use, then remove it manually if needed.")
-    except OSError as e:
-        print(f"Warning: Could not remove legacy file '{txt_path}': {e}")
-
-print("Cleanup attempt finished.")
+if os.path.exists(txt_path) and safe_remove(txt_path):
+    print(f"Removed file: {txt_path}")
 
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 
@@ -419,54 +474,42 @@ if __name__ == "__main__":
                 print(f"Error restarting: {e}")
                 os.execl(python, python, script_path, *sys.argv[1:])
             
-    def safe_remove_file(file_path):
-        """Safely remove a file if it exists."""
-        if os.path.exists(file_path) and os.path.isfile(file_path):
-            try:
-                os.remove(file_path)
-                return True
-            except PermissionError:
-                print(Fore.YELLOW + f"Warning: Access Denied. Could not remove '{file_path}'. Check permissions or if file is in use." + Style.RESET_ALL)
-            except OSError as e:
-                print(Fore.YELLOW + f"Warning: Could not remove '{file_path}': {e}" + Style.RESET_ALL)
-        return False
 
     def install_packages(requirements_txt_path: str, debug: bool = False) -> bool:
-        """Install packages from requirements.txt file if needed."""
-        with open(requirements_txt_path, "r") as f: 
-            lines = [line.strip() for line in f]
+        """Install packages from requirements.txt file using pip install -r."""
+        full_command = [sys.executable, "-m", "pip", "install", "-r", requirements_txt_path, "--no-cache-dir"]
         
-        success = []
-            
-        for dependency in lines:
-            full_command = [sys.executable, "-m", "pip", "install", dependency, "--no-cache-dir"]
-            
-        
-            try:
-                if debug:
-                    subprocess.check_call(full_command, timeout=1200)
-                else:
-                    subprocess.check_call(full_command, timeout=1200, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                    
-                success.append(0)
-            except Exception as _:
-                success.append(1)
-                
-        return sum(success) == 0
+        try:
+            if debug:
+                subprocess.check_call(full_command, timeout=1200)
+            else:
+                subprocess.check_call(full_command, timeout=1200, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return True
+        except Exception as e:
+            if debug:
+                print(f"Failed to install requirements: {e}")
+            return False
     
     async def check_and_update_files():
-        release_info = get_latest_release_info()
+        beta_mode = "--beta" in sys.argv
+        release_info = get_latest_release_info(beta_mode=beta_mode)
         
         if release_info:
             latest_tag = release_info["tag_name"]
             source_name = release_info["source"]
             
-            if os.path.exists("version"):
+            # For beta mode, always show as update available
+            if beta_mode:
+                print(Fore.YELLOW + f"Beta mode: Pulling latest from main branch" + Style.RESET_ALL)
+                current_version = "beta-mode"  # Force update in beta mode
+            elif os.path.exists("version"):
                 with open("version", "r") as f:
                     current_version = f.read().strip()
             else:
                 current_version = "v0.0.0"
-            print(Fore.CYAN + f"Current version: {current_version}" + Style.RESET_ALL)
+            
+            if not beta_mode:
+                print(Fore.CYAN + f"Current version: {current_version}" + Style.RESET_ALL)
 
             if current_version != latest_tag:
                 print(Fore.YELLOW + f"New version available: {latest_tag} (from {source_name})" + Style.RESET_ALL)
@@ -493,9 +536,7 @@ if __name__ == "__main__":
                         
                         db_bak_path = "db.bak"
                         if os.path.exists(db_bak_path) and os.path.isdir(db_bak_path):
-                            try:
-                                shutil.rmtree(db_bak_path)
-                            except (PermissionError, OSError) as e: # Create a timestamped backup to avoid upgrading without first having a backup
+                            if not safe_remove(db_bak_path): # Create a timestamped backup to avoid upgrading without first having a backup
                                 db_bak_path = f"db.bak_{int(datetime.now().timestamp())}"
                                 print(Fore.YELLOW + f"WARNING: Couldn't remove db.bak folder: {e}. Making backup with timestamp instead." + Style.RESET_ALL)
 
@@ -511,7 +552,7 @@ if __name__ == "__main__":
                         return
                         
                     print(Fore.YELLOW + f"Downloading update from {source_name}..." + Style.RESET_ALL)
-                    safe_remove_file("package.zip")
+                    safe_remove("package.zip")
                     download_resp = requests.get(download_url, timeout=600)
                     
                     if download_resp.status_code == 200:
@@ -519,10 +560,8 @@ if __name__ == "__main__":
                             f.write(download_resp.content)
                         
                         if os.path.exists("update") and os.path.isdir("update"):
-                            try:
-                                shutil.rmtree("update")
-                            except (PermissionError, OSError) as e:
-                                print(Fore.RED + f"WARNING: Could not remove previous update directory: {e}" + Style.RESET_ALL)
+                            if not safe_remove("update"):
+                                print(Fore.RED + "WARNING: Could not remove previous update directory" + Style.RESET_ALL)
                                 return
                             
                         try:
@@ -531,38 +570,42 @@ if __name__ == "__main__":
                             print(Fore.RED + f"ERROR: Failed to extract update package: {e}" + Style.RESET_ALL)
                             return
                             
-                        safe_remove_file("package.zip")
+                        safe_remove("package.zip")
                         
-                        if os.path.exists("update/main.py"):
-                            try:
-                                if os.path.exists("main.py.bak"):
-                                    os.remove("main.py.bak")
-                            except Exception as _:
-                                pass
+                        # Find the extracted directory (GitHub/GitLab archives create a subdirectory)
+                        update_dir = "update"
+                        extracted_items = os.listdir(update_dir)
+                        if len(extracted_items) == 1 and os.path.isdir(os.path.join(update_dir, extracted_items[0])):
+                            update_dir = os.path.join(update_dir, extracted_items[0])
+                        
+                        # Handle main.py update
+                        main_py_path = os.path.join(update_dir, "main.py")
+                        if os.path.exists(main_py_path):
+                            safe_remove("main.py.bak")
                                 
                             try:
                                 if os.path.exists("main.py"):
                                     os.rename("main.py", "main.py.bak")
                             except Exception as e:
                                 print(Fore.YELLOW + f"Could not backup main.py: {e}" + Style.RESET_ALL)
-                                try: # If backup fails, just remove the current file
-                                    if os.path.exists("main.py"):
-                                        os.remove("main.py")
-                                        print(Fore.YELLOW + "Removed current main.py" + Style.RESET_ALL)
-                                except Exception as _:
+                                # If backup fails, just remove the current file
+                                if safe_remove("main.py"):
+                                    print(Fore.YELLOW + "Removed current main.py" + Style.RESET_ALL)
+                                else:
                                     print(Fore.RED + "Warning: Could not backup or remove current main.py" + Style.RESET_ALL)
                             
                             try:
-                                shutil.copy2("update/main.py", "main.py")
+                                shutil.copy2(main_py_path, "main.py")
                             except Exception as e:
                                 print(Fore.RED + f"ERROR: Could not install new main.py: {e}" + Style.RESET_ALL)
                                 return
                             
-                        if os.path.exists("update/requirements.txt"):                      
+                        requirements_path = os.path.join(update_dir, "requirements.txt")
+                        if os.path.exists(requirements_path):                      
                             print(Fore.YELLOW + "Installing any new requirements..." + Style.RESET_ALL)
                             
-                            success = install_packages("update/requirements.txt", debug="--verbose" in sys.argv or "--debug" in sys.argv)
-                            safe_remove_file("update/requirements.txt")
+                            success = install_packages(requirements_path, debug="--verbose" in sys.argv or "--debug" in sys.argv)
+                            safe_remove(requirements_path)
                             
                             if success:
                                 print(Fore.GREEN + "New requirements installed." + Style.RESET_ALL)
@@ -570,30 +613,57 @@ if __name__ == "__main__":
                                 print(Fore.RED + "Failed to install requirements." + Style.RESET_ALL)
                                 return
                             
-                        for root, _, files in os.walk("update"):
+                        for root, _, files in os.walk(update_dir):
                             for file in files:
-                                rel_path = os.path.relpath(os.path.join(root, file), "update")
+                                if file == "main.py":
+                                    continue
+                                    
+                                src_path = os.path.join(root, file)
+                                rel_path = os.path.relpath(src_path, update_dir)
                                 dst_path = os.path.join(".", rel_path)
+                                
+                                # Skip certain files that shouldn't be overwritten
+                                if file in ["bot_token.txt", "version"] or dst_path.startswith("db/") or dst_path.startswith("db\\"):
+                                    continue
                                 
                                 os.makedirs(os.path.dirname(dst_path), exist_ok=True)
 
                                 if os.path.exists(dst_path):
-                                    backup_path = f"{dst_path}.bak"
-                                    safe_remove_file(backup_path)
-                                    try:
-                                        os.rename(dst_path, backup_path)
-                                    except Exception as e: # Continue anyway to try to update the file
-                                        print(Fore.YELLOW + f"Could not create backup of {dst_path}: {e}" + Style.RESET_ALL)
+                                    norm_path = dst_path.replace("\\", "/")
+                                    if norm_path.startswith("cogs/") or norm_path.startswith("./cogs/"):
+                                        # Calculate file hashes to check if backup is needed
+                                        src_hash = calculate_file_hash(src_path)
+                                        dst_hash = calculate_file_hash(dst_path)
+                                        
+                                        if src_hash != dst_hash:
+                                            # Files are different, create backup
+                                            cogs_bak_dir = "cogs.bak"
+                                            os.makedirs(cogs_bak_dir, exist_ok=True)
+                                            
+                                            # Get relative path within cogs directory
+                                            rel_path_in_cogs = os.path.relpath(dst_path, "cogs")
+                                            backup_path = os.path.join(cogs_bak_dir, rel_path_in_cogs)
+                                            
+                                            # Create subdirectories in backup if needed
+                                            os.makedirs(os.path.dirname(backup_path), exist_ok=True)
+                                            
+                                            try:
+                                                # Remove old backup if exists
+                                                if os.path.exists(backup_path):
+                                                    os.remove(backup_path)
+                                                # Copy current file to backup
+                                                shutil.copy2(dst_path, backup_path)
+                                                print(Fore.GREEN + f"Backed up: {dst_path} → {backup_path}" + Style.RESET_ALL)
+                                            except Exception as e:
+                                                print(Fore.YELLOW + f"Could not create backup of {dst_path}: {e}" + Style.RESET_ALL)
                                         
                                 try:
-                                    shutil.copy2(os.path.join(root, file), dst_path)
+                                    shutil.copy2(src_path, dst_path)
                                 except Exception as e:
                                     print(Fore.RED + f"Failed to copy {file} to {dst_path}: {e}" + Style.RESET_ALL)
                         
-                        try:
-                            shutil.rmtree("update")
-                        except Exception as e:
-                            print(Fore.RED + f"WARNING: update folder could not be removed: {e}. You may want to remove it manually." + Style.RESET_ALL)
+                        if not safe_remove("update"):
+                            print(Fore.RED + "WARNING: update folder could not be removed. You may want to remove it manually." + Style.RESET_ALL)
                         
                         with open("version", "w") as f:
                             f.write(latest_tag)
@@ -764,7 +834,7 @@ if __name__ == "__main__":
     create_tables()
 
     async def load_cogs():
-        cogs = ["olddb", "control", "alliance", "alliance_member_operations", "bot_operations", "logsystem", "support_operations", "gift_operations", "changes", "w", "wel", "other_features", "bear_trap", "id_channel", "backup_operations", "bear_trap_editor", "attendance", "attendance_report"]
+        cogs = ["olddb", "control", "alliance", "alliance_member_operations", "bot_operations", "logsystem", "support_operations", "gift_operations", "changes", "w", "wel", "other_features", "bear_trap", "id_channel", "backup_operations", "bear_trap_editor", "attendance", "attendance_report", "minister_schedule", "minister_menu"]
         
         failed_cogs = []
         
@@ -794,7 +864,7 @@ if __name__ == "__main__":
                             data = response.json()
                             if data["tag_name"] == current_version:
                                 release_info = {
-                                    "download_url": f"https://github.com/whiteout-project/bot/archive/refs/tags/{current_version}.zip",
+                                    "download_url": f"https://github.com/whiteout-project/bot-dev/archive/refs/tags/{current_version}.zip",
                                     "source": source['name']
                                 }
                                 break
@@ -829,10 +899,17 @@ if __name__ == "__main__":
                             for file_info in zip_ref.namelist():
                                 if "/cogs/" in file_info and file_info.endswith(".py"):
                                     try: # Strip archive prefix if present
-                                        if file_info.startswith("bot-"):
-                                            target_path = file_info.split("/", 1)[1]
+                                        # Handle GitHub/GitLab archive structure
+                                        parts = file_info.split("/")
+                                        if len(parts) > 2 and parts[1] == "cogs":
+                                            # Format: repo-name-tag/cogs/file.py
+                                            target_path = "/".join(parts[1:])
+                                        elif "cogs/" in file_info:
+                                            # Find cogs directory and use everything from there
+                                            cogs_index = file_info.find("cogs/")
+                                            target_path = file_info[cogs_index:]
                                         else:
-                                            target_path = file_info
+                                            continue
                                         
                                         with zip_ref.open(file_info) as source:
                                             os.makedirs(os.path.dirname(target_path), exist_ok=True)
@@ -841,7 +918,7 @@ if __name__ == "__main__":
                                     except Exception as e:
                                         print(f"Failed to extract {file_info}: {e}")
                         
-                        safe_remove_file("temp_recovery.zip")
+                        safe_remove("temp_recovery.zip")
                         
                         # Retry loading failed cogs
                         retry_failed = []

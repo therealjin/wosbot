@@ -2,16 +2,12 @@ import discord
 from discord.ext import commands
 from discord import app_commands
 import sqlite3
-import aiohttp
-import hashlib
-import time
 import asyncio
+import time
 from typing import List
 from datetime import datetime
 import os
-import ssl
-
-SECRET = 'tB87#kPtkxqOS2'
+from .login_handler import LoginHandler
 
 class PaginationView(discord.ui.View):
     def __init__(self, chunks: List[discord.Embed], author_id: int):
@@ -103,6 +99,9 @@ class AllianceMemberOperations(commands.Cog):
         if not os.path.exists(self.log_directory):
             os.makedirs(self.log_directory)
         self.log_file = os.path.join(self.log_directory, 'alliance_memberlog.txt')
+        
+        # Initialize login handler for centralized API management
+        self.login_handler = LoginHandler()
 
     def log_message(self, message: str):
         timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
@@ -110,8 +109,6 @@ class AllianceMemberOperations(commands.Cog):
         
         with open(self.log_file, 'a', encoding='utf-8') as f:
             f.write(log_entry)
-        
-
 
     def get_fl_emoji(self, fl_level: int) -> str:
         for level_range, emoji in self.fl_emojis.items():
@@ -345,7 +342,7 @@ class AllianceMemberOperations(commands.Cog):
                             color=discord.Color.red()
                         )
 
-                        member_view = MemberSelectView(members, alliance_name, self.cog)
+                        member_view = MemberSelectView(members, alliance_name, self.cog, is_remove_operation=True)
                         
                         async def member_callback(member_interaction: discord.Interaction):
                             selected_value = member_view.current_select.values[0]
@@ -728,7 +725,6 @@ class AllianceMemberOperations(commands.Cog):
                             special_alliance_text += f"🔸 {name}\n"
                         special_alliance_text += "━━━━━━━━━━━━━━━━━━━━━━"
 
-                    
                     select_embed = discord.Embed(
                         title="🔄 Alliance Selection - Member Transfer",
                         description=(
@@ -757,7 +753,6 @@ class AllianceMemberOperations(commands.Cog):
                     async def source_callback(interaction: discord.Interaction):
                         try:
                             source_alliance_id = int(view.current_select.values[0])
-                            
                             
                             with sqlite3.connect('db/alliance.sqlite') as alliance_db:
                                 cursor = alliance_db.cursor()
@@ -805,11 +800,10 @@ class AllianceMemberOperations(commands.Cog):
                                 color=discord.Color.blue()
                             )
 
-                            member_view = MemberSelectView(members, source_alliance_name, self.cog)
+                            member_view = MemberSelectView(members, source_alliance_name, self.cog, is_remove_operation=False)
                             
                             async def member_callback(member_interaction: discord.Interaction):
                                 selected_fid = int(member_view.current_select.values[0])
-                                
                                 
                                 with sqlite3.connect('db/users.sqlite') as users_db:
                                     cursor = users_db.cursor()
@@ -848,7 +842,6 @@ class AllianceMemberOperations(commands.Cog):
                                     target_alliance_id = int(target_select.values[0])
                                     
                                     try:
-                                        
                                         with sqlite3.connect('db/alliance.sqlite') as alliance_db:
                                             cursor = alliance_db.cursor()
                                             cursor.execute("SELECT name FROM alliance_list WHERE alliance_id = ?", (target_alliance_id,))
@@ -862,7 +855,6 @@ class AllianceMemberOperations(commands.Cog):
                                             )
                                             users_db.commit()
 
-                                        
                                         success_embed = discord.Embed(
                                             title="✅ Transfer Successful",
                                             description=(
@@ -880,7 +872,7 @@ class AllianceMemberOperations(commands.Cog):
                                         )
                                         
                                     except Exception as e:
-                                        self.log_message(f"Transfer error: {e}")
+                                        print(f"Transfer error: {e}")
                                         error_embed = discord.Embed(
                                             title="❌ Error",
                                             description="An error occurred during the transfer operation.",
@@ -927,135 +919,6 @@ class AllianceMemberOperations(commands.Cog):
         view = MemberOperationsView(self)
         await interaction.response.edit_message(embed=embed, view=view)
 
-    async def add_member(self, interaction: discord.Interaction):
-        self.c_alliance.execute("SELECT alliance_id, name FROM alliance_list")
-        alliances = self.c_alliance.fetchall()
-        alliance_options = [discord.SelectOption(label=name, value=str(alliance_id)) for alliance_id, name in alliances]
-
-        select = discord.ui.Select(placeholder="Select an alliance", options=alliance_options)
-        view = discord.ui.View()
-        view.add_item(select)
-
-        async def select_callback(select_interaction: discord.Interaction):
-            alliance_id = select.values[0]
-            await select_interaction.response.send_modal(AddMemberModal(alliance_id))
-
-        select.callback = select_callback
-        await interaction.response.send_message("Please select an alliance:", view=view, ephemeral=True)
-
-    async def remove_member(self, interaction: discord.Interaction):
-        self.c_alliance.execute("SELECT alliance_id, name FROM alliance_list")
-        alliances = self.c_alliance.fetchall()
-        alliance_options = [discord.SelectOption(label=name, value=str(alliance_id)) for alliance_id, name in alliances]
-
-        select = discord.ui.Select(placeholder="Select an alliance", options=alliance_options)
-        view = discord.ui.View()
-        view.add_item(select)
-
-        async def select_callback(select_interaction: discord.Interaction):
-            alliance_id = select.values[0]
-            
-            
-            self.c_users.execute("SELECT fid, nickname FROM users WHERE alliance = ?", (alliance_id,))
-            members = self.c_users.fetchall()
-            
-            if not members:
-                await select_interaction.response.send_message("No members found in this alliance.", ephemeral=True)
-                return
-
-            
-            member_options = [
-                discord.SelectOption(
-                    label=f"{nickname[:80]}",  
-                    value=str(fid),
-                    description=f"FID: {fid}"
-                ) for fid, nickname in members
-            ]
-            
-            
-            member_options.insert(0, discord.SelectOption(
-                label="ALL MEMBERS",
-                value="all",
-                description="⚠️ Selecting this will remove all members!"
-            ))
-
-            member_select = discord.ui.Select(
-                placeholder="Select member to remove",
-                options=member_options
-            )
-            member_view = discord.ui.View()
-            member_view.add_item(member_select)
-
-            async def member_select_callback(member_interaction: discord.Interaction):
-                selected_value = member_select.values[0]
-                
-                if selected_value == "all":
-                    
-                    embed = discord.Embed(
-                        title="⚠️ Confirmation Required",
-                        description=f"Total **{len(members)}** members will be removed.\nDo you confirm?",
-                        color=discord.Color.red()
-                    )
-                    
-                    confirm_view = discord.ui.View()
-                    confirm_view.add_item(discord.ui.Button(label="✅ Confirm", style=discord.ButtonStyle.success, custom_id="confirm_all"))
-                    confirm_view.add_item(discord.ui.Button(label="❌ Cancel", style=discord.ButtonStyle.danger, custom_id="cancel_all"))
-
-                    async def button_callback(button_interaction: discord.Interaction):
-                        try:
-                            if button_interaction.data["custom_id"] == "confirm_all":
-                                
-                                fid_list = [str(fid) for fid, _ in members]
-                                self.c_users.execute("DELETE FROM users WHERE alliance = ?", (alliance_id,))
-                                self.conn_users.commit()
-                                
-                                result_embed = discord.Embed(
-                                    title="✅ Members Removed",
-                                    description=f"Total **{len(members)}** members removed.\n\n**Removed FIDs:**\n{', '.join(fid_list)}",
-                                    color=discord.Color.green()
-                                )
-                                await button_interaction.response.edit_message(embed=result_embed, view=None)
-                            else:
-                                
-                                cancel_embed = discord.Embed(
-                                    title="❌ Operation Cancelled",
-                                    description="Member removal operation has been cancelled.",
-                                    color=discord.Color.orange()
-                                )
-                                await button_interaction.response.edit_message(embed=cancel_embed, view=None)
-                        except Exception as e:
-                            self.log_message(f"Error in button operation: {e}")
-
-                    
-                    for button in confirm_view.children:
-                        button.callback = button_callback
-
-                    await member_interaction.response.edit_message(embed=embed, view=confirm_view)
-                
-                else:
-                    try:
-                        selected_fid = selected_value
-                        self.c_users.execute("SELECT nickname FROM users WHERE fid = ?", (selected_fid,))
-                        nickname = self.c_users.fetchone()[0]
-                        
-                        self.c_users.execute("DELETE FROM users WHERE fid = ?", (selected_fid,))
-                        self.conn_users.commit()
-                        
-                        result_embed = discord.Embed(
-                            title="✅ Member Removed",
-                            description=f"**{nickname}** (FID: {selected_fid}) has been successfully removed.",
-                            color=discord.Color.green()
-                        )
-                        await member_interaction.response.edit_message(embed=result_embed, view=None)
-                    except Exception as e:
-                        self.log_message(f"Error in member removal: {e}")
-
-            member_select.callback = member_select_callback
-            await select_interaction.response.edit_message(content=None, view=member_view)
-
-        select.callback = select_callback
-        await interaction.response.send_message("Please select an alliance:", view=view, ephemeral=True)
-
     async def add_user(self, interaction: discord.Interaction, alliance_id: str, ids: str):
         self.c_alliance.execute("SELECT name FROM alliance_list WHERE alliance_id = ?", (alliance_id,))
         alliance_name = self.c_alliance.fetchone()
@@ -1068,44 +931,143 @@ class AllianceMemberOperations(commands.Cog):
         if not await self.is_admin(interaction.user.id):
             await interaction.response.send_message("You do not have permission to use this command.", ephemeral=True)
             return
+        
+        # Always add to queue to ensure proper ordering
+        queue_position = await self.login_handler.queue_operation({
+            'type': 'member_addition',
+            'callback': lambda: self._process_add_user(interaction, alliance_id, alliance_name, ids),
+            'description': f"Add members to {alliance_name}",
+            'alliance_id': alliance_id,
+            'interaction': interaction
+        })
+        
+        # Check if we need to show queue message
+        queue_info = self.login_handler.get_queue_info()
+        if queue_position > 1:  # Not the first in queue
+            queue_embed = discord.Embed(
+                title="⏳ Operation Queued",
+                description=(
+                    f"Another operation is currently in progress.\n\n"
+                    f"**Your operation has been queued:**\n"
+                    f"📍 Queue Position: `{queue_position}`\n"
+                    f"🏰 Alliance: {alliance_name}\n"
+                    f"👥 Members to add: {len(ids.split(',') if ',' in ids else ids.split('\n'))}\n\n"
+                    f"You will be notified when your operation starts."
+                ),
+                color=discord.Color.orange()
+            )
+            await interaction.response.send_message(embed=queue_embed, ephemeral=True)
+        else:
+            # First in queue - will start immediately
+            total_count = len(ids.split(',') if ',' in ids else ids.split('\n'))
+            embed = discord.Embed(
+                title="👥 User Addition Progress", 
+                description=f"Processing {total_count} members for **{alliance_name}**...\n\n**Progress:** `0/{total_count}`", 
+                color=discord.Color.blue()
+            )
+            embed.add_field(
+                name=f"\n✅ Successfully Added (0/{total_count})", 
+                value="-", 
+                inline=False
+            )
+            embed.add_field(
+                name=f"❌ Failed (0/{total_count})", 
+                value="-", 
+                inline=False
+            )
+            embed.add_field(
+                name=f"⚠️ Already Exists (0/{total_count})", 
+                value="-", 
+                inline=False
+            )
+            await interaction.response.send_message(embed=embed, ephemeral=True)
 
+    async def _process_add_user(self, interaction: discord.Interaction, alliance_id: str, alliance_name: str, ids: str):
+        """Process the actual user addition operation"""
         # Handle both comma-separated and newline-separated FIDs
         if '\n' in ids:
             ids_list = [fid.strip() for fid in ids.split('\n') if fid.strip()]
         else:
             ids_list = [fid.strip() for fid in ids.split(",") if fid.strip()]
 
+        # Pre-check which FIDs already exist in the database
+        already_in_db = []
+        fids_to_process = []
+        
+        for fid in ids_list:
+            self.c_users.execute("SELECT nickname FROM users WHERE fid=?", (fid,))
+            existing = self.c_users.fetchone()
+            if existing:
+                # Member already exists in database
+                already_in_db.append((fid, existing[0]))
+            else:
+                # Member doesn't exist at all
+                fids_to_process.append(fid)
+        
         total_users = len(ids_list)
-        embed = discord.Embed(
-            title="👥 User Addition Progress", 
-            description=f"Processing {total_users} members...\n\n**Progress:** `0/{total_users}`", 
-            color=discord.Color.blue()
-        )
-        embed.add_field(
-            name=f"✅ Successfully Added (0/{total_users})", 
-            value="-", 
-            inline=False
-        )
-        embed.add_field(
-            name=f"❌ Failed (0/{total_users})", 
-            value="-", 
-            inline=False
-        )
-        embed.add_field(
-            name=f"⚠️ Already Exists (0/{total_users})", 
-            value="-", 
-            inline=False
-        )
-
-        await interaction.response.send_message(embed=embed, ephemeral=True)
-        message = await interaction.original_response()
+        self.log_message(f"Pre-check complete: {len(already_in_db)} already exist, {len(fids_to_process)} to process")
+        
+        # For queued operations, we need to send a new progress embed
+        if interaction.response.is_done():
+            embed = discord.Embed(
+                title="👥 User Addition Progress", 
+                description=f"Processing {total_users} members...\n\n**Progress:** `0/{total_users}`", 
+                color=discord.Color.blue()
+            )
+            embed.add_field(
+                name=f"✅ Successfully Added (0/{total_users})", 
+                value="-", 
+                inline=False
+            )
+            embed.add_field(
+                name=f"❌ Failed (0/{total_users})", 
+                value="-", 
+                inline=False
+            )
+            embed.add_field(
+                name=f"⚠️ Already Exists (0/{total_users})", 
+                value="-", 
+                inline=False
+            )
+            message = await interaction.followup.send(embed=embed, ephemeral=True)
+        else:
+            # For immediate operations, the progress embed is already sent
+            message = await interaction.original_response()
+            # Get the embed from the existing message
+            embed = (await interaction.original_response()).embeds[0]
+        
+        # Reset rate limit tracking for this operation
+        self.login_handler.api1_requests = []
+        self.login_handler.api2_requests = []
+        
+        # Check API availability before starting
+        embed.description = "🔍 Checking API availability..."
+        await message.edit(embed=embed)
+        
+        await self.login_handler.check_apis_availability()
+        
+        if not self.login_handler.available_apis:
+            # No APIs available
+            embed.description = "❌ Both APIs are unavailable. Cannot proceed."
+            embed.color = discord.Color.red()
+            await message.edit(embed=embed)
+            return
+        
+        # Get processing rate from login handler
+        rate_text = self.login_handler.get_processing_rate()
+        
+        # Update embed with rate information
+        queue_info = f"\n📋 **Operations in queue:** {self.login_handler.get_queue_info()['queue_size']}" if self.login_handler.get_queue_info()['queue_size'] > 0 else ""
+        embed.description = f"Processing {total_users} members...\n{rate_text}{queue_info}\n\n**Progress:** `0/{total_users}`"
+        embed.color = discord.Color.blue()
+        await message.edit(embed=embed)
 
         added_count = 0
         error_count = 0 
-        already_exists_count = 0
+        already_exists_count = len(already_in_db)
         added_users = []
         error_users = []
-        already_exists_users = []
+        already_exists_users = already_in_db.copy()
 
         timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         log_file_path = os.path.join(self.log_directory, 'add_memberlog.txt')
@@ -1118,145 +1080,158 @@ class AllianceMemberOperations(commands.Cog):
                 log_file.write(f"Alliance: {alliance_name} (ID: {alliance_id})\n")
                 log_file.write(f"FIDs to Process: {ids.replace(chr(10), ', ')}\n")
                 log_file.write(f"Total Members to Process: {total_users}\n")
+                log_file.write(f"API Mode: {self.login_handler.get_mode_text()}\n")
+                log_file.write(f"Available APIs: {self.login_handler.available_apis}\n")
+                log_file.write(f"Operations in Queue: {self.login_handler.get_queue_info()['queue_size']}\n")
                 log_file.write('-'*50 + '\n')
 
+            # Update initial display with pre-existing members
+            if already_exists_count > 0:
+                embed.set_field_at(
+                    2,
+                    name=f"⚠️ Already Exists ({already_exists_count}/{total_users})",
+                    value="Existing user list cannot be displayed due to exceeding 70 users" if len(already_exists_users) > 70 
+                    else ", ".join([n for _, n in already_exists_users]) or "-",
+                    inline=False
+                )
+                await message.edit(embed=embed)
+            
             index = 0
-            while index < len(ids_list):
-                fid = ids_list[index]
+            while index < len(fids_to_process):
+                fid = fids_to_process[index]
                 try:
-                    embed.description = f"Processing {total_users} members...\n\n**Progress:** `{index + 1}/{total_users}`"
+                    # Update progress
+                    queue_info = f"\n📋 **Operations in queue:** {self.login_handler.get_queue_info()['queue_size']}" if self.login_handler.get_queue_info()['queue_size'] > 0 else ""
+                    current_progress = already_exists_count + index + 1
+                    embed.description = f"Processing {total_users} members...\n{rate_text}{queue_info}\n\n**Progress:** `{current_progress}/{total_users}`"
+                    await message.edit(embed=embed)
                     
-                    async with aiohttp.ClientSession() as session:
-                        current_time = int(time.time() * 1000)
-                        form = f"fid={fid}&time={current_time}"
-                        sign = hashlib.md5((form + SECRET).encode('utf-8')).hexdigest()
-                        form = f"sign={sign}&{form}"
-                        headers = {'Content-Type': 'application/x-www-form-urlencoded'}
+                    # Fetch player data using login handler
+                    result = await self.login_handler.fetch_player_data(fid)
+                    
+                    with open(log_file_path, 'a', encoding='utf-8') as log_file:
+                        log_file.write(f"\nAPI Response for FID {fid}:\n")
+                        log_file.write(f"Status: {result['status']}\n")
+                        if result.get('api_used'):
+                            log_file.write(f"API Used: {result['api_used']}\n")
+                    
+                    if result['status'] == 'rate_limited':
+                        # Handle rate limiting with countdown
+                        wait_time = result.get('wait_time', 60)
+                        countdown_start = time.time()
+                        remaining_time = wait_time
+                        
+                        with open(log_file_path, 'a', encoding='utf-8') as log_file:
+                            log_file.write(f"Rate limit reached - Total wait time: {wait_time:.1f} seconds\n")
+                        
+                        # Update display with countdown
+                        while remaining_time > 0:
+                            queue_info = f"\n📋 **Operations in queue:** {self.login_handler.get_queue_info()['queue_size']}" if self.login_handler.get_queue_info()['queue_size'] > 0 else ""
+                            embed.description = f"⚠️ Rate limit reached. Waiting {remaining_time:.0f} seconds...{queue_info}"
+                            embed.color = discord.Color.orange()
+                            await message.edit(embed=embed)
+                            
+                            # Wait for up to 5 seconds before updating
+                            await asyncio.sleep(min(5, remaining_time))
+                            elapsed = time.time() - countdown_start
+                            remaining_time = max(0, wait_time - elapsed)
+                        
+                        embed.color = discord.Color.blue()
+                        continue  # Retry this request
+                    
+                    if result['status'] == 'success':
+                        data = result['data']
+                        with open(log_file_path, 'a', encoding='utf-8') as log_file:
+                            log_file.write(f"API Response Data: {str(data)}\n")
+                        
+                        nickname = data.get('nickname')
+                        furnace_lv = data.get('stove_lv', 0)
+                        stove_lv_content = data.get('stove_lv_content', None)
+                        kid = data.get('kid', None)
 
-                        ssl_context = ssl.create_default_context()
-                        ssl_context.check_hostname = False
-                        ssl_context.verify_mode = ssl.CERT_NONE
-
-                        connector = aiohttp.TCPConnector(ssl=ssl_context)
-                        async with aiohttp.ClientSession(connector=connector) as session:
-                            async with session.post('https://wos-giftcode-api.centurygame.com/api/player', headers=headers, data=form) as response:
-                                with open(log_file_path, 'a', encoding='utf-8') as log_file:
-                                    log_file.write(f"\nAPI Response for FID {fid}:\n")
-                                    log_file.write(f"Status Code: {response.status}\n")
+                        if nickname:
+                            try: # Since we pre-filtered, this FID should not exist in database
+                                self.c_users.execute("""
+                                    INSERT INTO users (fid, nickname, furnace_lv, kid, stove_lv_content, alliance)
+                                    VALUES (?, ?, ?, ?, ?, ?)
+                                """, (fid, nickname, furnace_lv, kid, stove_lv_content, alliance_id))
+                                self.conn_users.commit()
                                 
-                                if response.status == 429:
-                                    with open(log_file_path, 'a', encoding='utf-8') as log_file:
-                                        log_file.write("Rate Limit exceeded - Waiting 60 seconds\n")
-                                    
-                                    embed.description = "⚠️ API rate limit reached. Waiting for 60 seconds..."
-                                    embed.color = discord.Color.orange()
-                                    await message.edit(embed=embed)
-                                    await asyncio.sleep(60)
-                                    embed.description = f"Processing {total_users} members...\n\n**Progress:** `{index + 1}/{total_users}`"
-                                    embed.color = discord.Color.blue()
-                                    await message.edit(embed=embed)
-                                    continue
-
-                                if response.status == 200:
-                                    data = await response.json()
-                                    with open(log_file_path, 'a', encoding='utf-8') as log_file:
-                                        log_file.write(f"API Response Data: {str(data)}\n")
-                                    
-                                    if not data.get('data'):
-                                        with open(log_file_path, 'a', encoding='utf-8') as log_file:
-                                            log_file.write(f"ERROR: No data found for FID {fid}\n")
-                                        error_count += 1
-                                        if fid not in error_users:
-                                            error_users.append(fid)
-                                        with open(self.log_file, 'a', encoding='utf-8') as f:
-                                            f.write(f"[{timestamp}] No data found for fid: {fid}\n")
-                                            f.write(f"[{timestamp}] API Response: {str(data)}\n")
-                                        
-                                        embed.set_field_at(
-                                            1,
-                                            name=f"❌ Failed ({error_count}/{total_users})",
-                                            value="Error list cannot be displayed due to exceeding 70 users" if len(error_users) > 70 
-                                            else ", ".join(error_users) or "-",
-                                            inline=False
-                                        )
-                                        await message.edit(embed=embed)
-                                        index += 1
-                                        continue
-
-                                    nickname = data['data'].get('nickname')
-                                    furnace_lv = data['data'].get('stove_lv', 0)
-                                    stove_lv_content = data['data'].get('stove_lv_content', None)
-                                    kid = data['data'].get('kid', None)
-
-                                    if nickname:
-                                        self.c_users.execute("SELECT * FROM users WHERE fid=?", (fid,))
-                                        result = self.c_users.fetchone()
-
-                                        if result is None:
-                                            try:
-                                                self.c_users.execute("""
-                                                    INSERT INTO users (fid, nickname, furnace_lv, kid, stove_lv_content, alliance)
-                                                    VALUES (?, ?, ?, ?, ?, ?)
-                                                """, (fid, nickname, furnace_lv, kid, stove_lv_content, alliance_id))
-                                                self.conn_users.commit()
-                                                
-                                                with open(self.log_file, 'a', encoding='utf-8') as f:
-                                                    f.write(f"[{timestamp}] Successfully added member - FID: {fid}, Nickname: {nickname}, Level: {furnace_lv}\n")
-                                                    f.write(f"[{timestamp}] API Response: {str(data)}\n")
-                                                
-                                                added_count += 1
-                                                added_users.append((fid, nickname))
-                                                
-                                                embed.set_field_at(
-                                                    0,
-                                                    name=f"✅ Successfully Added ({added_count}/{total_users})",
-                                                    value="User list cannot be displayed due to exceeding 70 users" if len(added_users) > 70 
-                                                    else ", ".join([n for _, n in added_users]) or "-",
-                                                    inline=False
-                                                )
-                                                await message.edit(embed=embed)
-                                                
-                                            except Exception as e:
-                                                with open(log_file_path, 'a', encoding='utf-8') as log_file:
-                                                    log_file.write(f"ERROR: Database error for FID {fid}: {str(e)}\n")
-                                                error_count += 1
-                                                error_users.append(fid)
-                                                
-                                                embed.set_field_at(
-                                                    1,
-                                                    name=f"❌ Failed ({error_count}/{total_users})",
-                                                    value="Error list cannot be displayed due to exceeding 70 users" if len(error_users) > 70 
-                                                    else ", ".join(error_users) or "-",
-                                                    inline=False
-                                                )
-                                                await message.edit(embed=embed)
-                                        else:
-                                            with open(log_file_path, 'a', encoding='utf-8') as log_file:
-                                                log_file.write(f"WARNING: Member already exists - {nickname} (FID: {fid})\n")
-                                            already_exists_count += 1
-                                            already_exists_users.append((fid, nickname))
-                                            
-                                            embed.set_field_at(
-                                                2,
-                                                name=f"⚠️ Already Exists ({already_exists_count}/{total_users})",
-                                                value="Existing user list cannot be displayed due to exceeding 70 users" if len(already_exists_users) > 70 
-                                                else ", ".join([n for _, n in already_exists_users]) or "-",
-                                                inline=False
-                                            )
-                                            await message.edit(embed=embed)
-                                    else:
-                                        error_count += 1
-                                        error_users.append(fid)
-
+                                with open(self.log_file, 'a', encoding='utf-8') as f:
+                                    f.write(f"[{timestamp}] Successfully added member - FID: {fid}, Nickname: {nickname}, Level: {furnace_lv}\n")
+                                
+                                added_count += 1
+                                added_users.append((fid, nickname))
+                                
+                                embed.set_field_at(
+                                    0,
+                                    name=f"✅ Successfully Added ({added_count}/{total_users})",
+                                    value="User list cannot be displayed due to exceeding 70 users" if len(added_users) > 70 
+                                    else ", ".join([n for _, n in added_users]) or "-",
+                                    inline=False
+                                )
+                                await message.edit(embed=embed)
+                                
+                            except sqlite3.IntegrityError as e:
+                                # This shouldn't happen since we pre-filtered, but handle it just in case
+                                with open(log_file_path, 'a', encoding='utf-8') as log_file:
+                                    log_file.write(f"ERROR: Member already exists (race condition?) - FID {fid}: {str(e)}\n")
+                                already_exists_count += 1
+                                already_exists_users.append((fid, nickname))
+                                
+                                embed.set_field_at(
+                                    2,
+                                    name=f"⚠️ Already Exists ({already_exists_count}/{total_users})",
+                                    value="Existing user list cannot be displayed due to exceeding 70 users" if len(already_exists_users) > 70 
+                                    else ", ".join([n for _, n in already_exists_users]) or "-",
+                                    inline=False
+                                )
+                                await message.edit(embed=embed)
+                                
+                            except Exception as e:
+                                with open(log_file_path, 'a', encoding='utf-8') as log_file:
+                                    log_file.write(f"ERROR: Database error for FID {fid}: {str(e)}\n")
+                                error_count += 1
+                                error_users.append(fid)
+                                
+                                embed.set_field_at(
+                                    1,
+                                    name=f"❌ Failed ({error_count}/{total_users})",
+                                    value="Error list cannot be displayed due to exceeding 70 users" if len(error_users) > 70 
+                                    else ", ".join(error_users) or "-",
+                                    inline=False
+                                )
+                                await message.edit(embed=embed)
+                        else:
+                            # No nickname in API response
+                            error_count += 1
+                            error_users.append(fid)
+                    else:
+                            # Handle other error statuses
+                            error_msg = result.get('error_message', 'Unknown error')
+                            with open(log_file_path, 'a', encoding='utf-8') as log_file:
+                                log_file.write(f"ERROR: {error_msg} for FID {fid}\n")
+                            error_count += 1
+                            if fid not in error_users:
+                                error_users.append(fid)
+                            embed.set_field_at(
+                                1,
+                                name=f"❌ Failed ({error_count}/{total_users})",
+                                value="Error list cannot be displayed due to exceeding 70 users" if len(error_users) > 70 
+                                else ", ".join(error_users) or "-",
+                                inline=False
+                            )
+                            await message.edit(embed=embed)
+                    
                     index += 1
 
                 except Exception as e:
                     with open(log_file_path, 'a', encoding='utf-8') as log_file:
                         log_file.write(f"ERROR: Request failed for FID {fid}: {str(e)}\n")
-                    error_count += 1
-                    error_users.append(fid)
-                    await message.edit(embed=embed)
-                    index += 1
+                        error_count += 1
+                        error_users.append(fid)
+                        await message.edit(embed=embed)
+                        index += 1
 
             embed.set_field_at(0, name=f"✅ Successfully Added ({added_count}/{total_users})",
                 value="User list cannot be displayed due to exceeding 70 users" if len(added_users) > 70 
@@ -1323,6 +1298,9 @@ class AllianceMemberOperations(commands.Cog):
                 log_file.write(f"Successfully Added: {added_count}\n")
                 log_file.write(f"Failed: {error_count}\n")
                 log_file.write(f"Already Exists: {already_exists_count}\n")
+                log_file.write(f"API Mode: {self.login_handler.get_mode_text()}\n")
+                log_file.write(f"API1 Requests: {len(self.login_handler.api1_requests)}\n")
+                log_file.write(f"API2 Requests: {len(self.login_handler.api2_requests)}\n")
                 log_file.write(f"{'='*50}\n")
 
         except Exception as e:
@@ -1330,8 +1308,18 @@ class AllianceMemberOperations(commands.Cog):
                 log_file.write(f"CRITICAL ERROR: {str(e)}\n")
                 log_file.write(f"{'='*50}\n")
 
+        # Calculate total processing time
+        end_time = datetime.now()
+        start_time = datetime.strptime(timestamp, '%Y-%m-%d %H:%M:%S')
+        processing_time = (end_time - start_time).total_seconds()
+        
+        queue_info = f"📋 **Operations still in queue:** {self.login_handler.get_queue_info()['queue_size']}" if self.login_handler.get_queue_info()['queue_size'] > 0 else ""
+        
         embed.title = "✅ User Addition Completed"
-        embed.description = f"Process completed for {total_users} members."
+        embed.description = (
+            f"Process completed for {total_users} members.\n"
+            f"**Processing Time:** {processing_time:.1f} seconds{queue_info}\n\n"
+        )
         embed.color = discord.Color.green()
         await message.edit(embed=embed)
 
@@ -1474,25 +1462,14 @@ class AddMemberModal(discord.ui.Modal):
                 ids
             )
         except Exception as e:
-            self.log_message(f"ERROR: Modal submit error - {str(e)}")
+            print(f"ERROR: Modal submit error - {str(e)}")
             await interaction.response.send_message(
                 "An error occurred. Please try again.", 
                 ephemeral=True
             )
 
-class RemoveMemberModal(discord.ui.Modal):
-    def __init__(self, alliance_id):
-        super().__init__(title="Remove Member")
-        self.alliance_id = alliance_id
-        self.add_item(discord.ui.InputText(label="Enter IDs (comma-separated)", placeholder="e.g., 12345,67890"))
-
-    async def callback(self, interaction: discord.Interaction):
-        ids = self.children[0].value
-        await interaction.client.get_cog("AllianceMemberOperations").remove_user(interaction, self.alliance_id, ids)
-
-
 class AllianceSelectView(discord.ui.View):
-    def __init__(self, alliances_with_counts, cog=None, page=0):
+    def __init__(self, alliances_with_counts, cog=None, page=0, context="transfer"):
         super().__init__(timeout=7200)
         self.alliances = alliances_with_counts
         self.cog = cog
@@ -1502,6 +1479,7 @@ class AllianceSelectView(discord.ui.View):
         self.callback = None
         self.member_dict = {}
         self.selected_alliance_id = None
+        self.context = context  # "transfer", "furnace_history", or "nickname_history"
         self.update_select_menu()
 
     def update_select_menu(self):
@@ -1561,22 +1539,26 @@ class AllianceSelectView(discord.ui.View):
             modal = FIDSearchModal(
                 selected_alliance_id=self.selected_alliance_id,
                 alliances=self.alliances,
-                callback=self.callback
+                callback=self.callback,
+                context=self.context,
+                cog=self.cog
             )
             await interaction.response.send_modal(modal)
         except Exception as e:
-            self.log_message(f"FID button error: {e}")
+            print(f"FID button error: {e}")
             await interaction.response.send_message(
                 "❌ An error has occurred. Please try again.",
                 ephemeral=True
             )
 
 class FIDSearchModal(discord.ui.Modal):
-    def __init__(self, selected_alliance_id=None, alliances=None, callback=None):
+    def __init__(self, selected_alliance_id=None, alliances=None, callback=None, context="transfer", cog=None):
         super().__init__(title="Search Members with FID")
         self.selected_alliance_id = selected_alliance_id
         self.alliances = alliances
         self.callback = callback
+        self.context = context
+        self.cog = cog
         
         self.add_item(discord.ui.TextInput(
             label="Member ID",
@@ -1590,7 +1572,24 @@ class FIDSearchModal(discord.ui.Modal):
         try:
             fid = self.children[0].value.strip()
             
+            # Check if we're in a history context
+            if self.context in ["furnace_history", "nickname_history"]:
+                # Get the Changes cog
+                changes_cog = self.cog.bot.get_cog("Changes") if self.cog else interaction.client.get_cog("Changes")
+                if changes_cog:
+                    await interaction.response.defer()
+                    if self.context == "furnace_history":
+                        await changes_cog.show_furnace_history(interaction, int(fid))
+                    else:
+                        await changes_cog.show_nickname_history(interaction, int(fid))
+                else:
+                    await interaction.response.send_message(
+                        "❌ History feature is not available.",
+                        ephemeral=True
+                    )
+                return
             
+            # Original transfer logic
             with sqlite3.connect('db/users.sqlite') as users_db:
                 cursor = users_db.cursor()
                 cursor.execute("""
@@ -1681,7 +1680,7 @@ class FIDSearchModal(discord.ui.Modal):
                         )
                         
                     except Exception as e:
-                        self.log_message(f"Transfer error: {e}")
+                        print(f"Transfer error: {e}")
                         error_embed = discord.Embed(
                             title="❌ Error",
                             description="An error occurred during the transfer operation.",
@@ -1700,7 +1699,6 @@ class FIDSearchModal(discord.ui.Modal):
                 )
 
         except Exception as e:
-            self.log_message(f"FID search error: {e}")
             print(f"Error details: {str(e.__class__.__name__)}")
             if not interaction.response.is_done():
                 await interaction.response.send_message(
@@ -1709,7 +1707,7 @@ class FIDSearchModal(discord.ui.Modal):
                 )
 
 class MemberSelectView(discord.ui.View):
-    def __init__(self, members, source_alliance_name, cog, page=0):
+    def __init__(self, members, source_alliance_name, cog, page=0, is_remove_operation=False):
         super().__init__(timeout=7200)
         self.members = members
         self.source_alliance_name = source_alliance_name
@@ -1721,6 +1719,7 @@ class MemberSelectView(discord.ui.View):
         self.member_dict = {str(fid): nickname for fid, nickname, _ in members}
         self.selected_alliance_id = None
         self.alliances = None
+        self.is_remove_operation = is_remove_operation
         self.update_select_menu()
 
     def update_select_menu(self):
@@ -1753,8 +1752,11 @@ class MemberSelectView(discord.ui.View):
         ]
         options.extend(member_options)
 
+        # Determine placeholder based on context (remove vs transfer)
+        placeholder_text = "👤 Select member to remove..." if hasattr(self, 'is_remove_operation') and self.is_remove_operation else "👤 Select member to transfer..."
+
         select = discord.ui.Select(
-            placeholder=f"👤 Select member to transfer... (Page {self.page + 1}/{self.max_page + 1})",
+            placeholder=f"{placeholder_text} (Page {self.page + 1}/{self.max_page + 1})",
             options=options
         )
         
@@ -1794,11 +1796,13 @@ class MemberSelectView(discord.ui.View):
             modal = FIDSearchModal(
                 selected_alliance_id=self.selected_alliance_id,
                 alliances=self.alliances,
-                callback=self.callback
+                callback=self.callback,
+                context=self.context,
+                cog=self.cog
             )
             await interaction.response.send_modal(modal)
         except Exception as e:
-            self.log_message(f"FID button error: {e}")
+            print(f"FID button error: {e}")
             await interaction.response.send_message(
                 "❌ An error has occurred. Please try again.",
                 ephemeral=True
