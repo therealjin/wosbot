@@ -107,7 +107,7 @@ class Control(commands.Cog):
             return {'error': result.get('error_message', 'Unknown error'), 'fid': fid}
 
     async def remove_invalid_fid(self, fid: str, reason: str):
-        """Safely remove an invalid FID from the database with logging"""
+        """Safely remove an invalid ID from the database with logging"""
         try:
             async with self.db_lock:
                 # Get user info before deletion for logging
@@ -122,14 +122,14 @@ class Control(commands.Cog):
                     self.conn_users.commit()
                     
                     # Log the deletion to alliance control log
-                    self.logger.warning(f"[AUTO-CLEANUP] Removed invalid FID {fid} (nickname: {nickname}) - Reason: {reason}")
+                    self.logger.warning(f"[AUTO-CLEANUP] Removed invalid ID {fid} (nickname: {nickname}) - Reason: {reason}")
                     
                     return True, nickname
         except Exception as e:
-            self.logger.error(f"Failed to remove invalid FID {fid}: {str(e)}")
+            self.logger.error(f"Failed to remove invalid ID {fid}: {str(e)}")
             return False, None
 
-    async def check_agslist(self, channel, alliance_id, interaction=None):
+    async def check_agslist(self, channel, alliance_id, interaction=None, interaction_message=None, alliance_name=None, is_batch=False, batch_info=None):
         async with self.db_lock:
             self.cursor_users.execute("SELECT fid, nickname, furnace_lv, stove_lv_content, kid FROM users WHERE alliance = ?", (alliance_id,))
             users = self.cursor_users.fetchall()
@@ -141,10 +141,49 @@ class Control(commands.Cog):
         checked_users = 0
 
         self.cursor_alliance.execute("SELECT name FROM alliance_list WHERE alliance_id = ?", (alliance_id,))
-        alliance_name = self.cursor_alliance.fetchone()[0]
+        alliance_name_from_db = self.cursor_alliance.fetchone()[0]
+        # Use provided name if available, otherwise use from database
+        if not alliance_name:
+            alliance_name = alliance_name_from_db
 
         start_time = datetime.now()
         self.logger.info(f"{alliance_name} Alliance Control started at {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
+        
+        # Update ephemeral message at start if provided
+        if interaction_message:
+            try:
+                if is_batch and batch_info:
+                    # For batch processing (all alliances)
+                    status_embed = discord.Embed(
+                        title="🔄 Alliance Control Operation",
+                        description=(
+                            "━━━━━━━━━━━━━━━━━━━━━━\n"
+                            f"📊 **Type:** All Alliances ({batch_info['total']} total)\n"
+                            f"🏰 **Currently Processing:** {alliance_name}\n"
+                            f"📍 **Progress:** {batch_info['current']}/{batch_info['total']} alliances\n"
+                            f"⏰ **Started:** <t:{int(start_time.timestamp())}:R>\n"
+                            "━━━━━━━━━━━━━━━━━━━━━━"
+                        ),
+                        color=discord.Color.blue()
+                    )
+                else:
+                    # For single alliance processing
+                    status_embed = discord.Embed(
+                        title="🔄 Alliance Control Operation",
+                        description=(
+                            "━━━━━━━━━━━━━━━━━━━━━━\n"
+                            f"📊 **Type:** Single Alliance\n"
+                            f"🏰 **Alliance:** {alliance_name}\n"
+                            f"📍 **Status:** In Progress\n"
+                            f"⏰ **Started:** <t:{int(start_time.timestamp())}:R>\n"
+                            f"📢 **Results Channel:** {channel.mention}\n"
+                            "━━━━━━━━━━━━━━━━━━━━━━"
+                        ),
+                        color=discord.Color.blue()
+                    )
+                await interaction_message.edit(embed=status_embed)
+            except Exception as e:
+                self.logger.warning(f"Could not update interaction message at start: {e}")
         
         async with self.db_lock:
             with sqlite3.connect('db/settings.sqlite') as settings_db:
@@ -209,9 +248,9 @@ class Control(commands.Cog):
                         # Handle error responses (including 40004)
                         error_msg = data.get('error', 'Unknown error')
                         
-                        # Check if this is a permanently invalid FID (not found)
+                        # Check if this is a permanently invalid ID (not found)
                         if error_msg == 'not_found':
-                            # Auto-remove the invalid FID
+                            # Auto-remove the invalid ID
                             removed, old_nickname = await self.remove_invalid_fid(fid, "Player does not exist (error 40004)")
                             if removed:
                                 check_fail_list.append(f"❌ `{fid}` ({old_nickname}) - Player not found (Auto-removed)")
@@ -220,7 +259,7 @@ class Control(commands.Cog):
                         else:
                             # For other errors, just report without removing
                             check_fail_list.append(f"❌ `{fid}` - {error_msg}")
-                            self.logger.warning(f"Failed to check FID {fid}: {error_msg}")
+                            self.logger.warning(f"Failed to check ID {fid}: {error_msg}")
                         
                         checked_users += 1
                     elif 'data' in data:
@@ -333,7 +372,7 @@ class Control(commands.Cog):
             )
             embed.add_field(
                 name="📈 Total Changes",
-                value=f"🔄 {len(furnace_changes) + len(nickname_changes) + len(kid_changes)} changes detected" + (f"\n🗑️ {sum(1 for item in check_fail_list if 'Auto-removed' in item)} invalid FIDs removed" if any('Auto-removed' in item for item in check_fail_list) else "") + (f"\n❌ {sum(1 for item in check_fail_list if 'Auto-removed' not in item)} check failures" if any('Auto-removed' not in item for item in check_fail_list) else ""),
+                value=f"🔄 {len(furnace_changes) + len(nickname_changes) + len(kid_changes)} changes detected" + (f"\n🗑️ {sum(1 for item in check_fail_list if 'Auto-removed' in item)} invalid IDs removed" if any('Auto-removed' in item for item in check_fail_list) else "") + (f"\n❌ {sum(1 for item in check_fail_list if 'Auto-removed' not in item)} check failures" if any('Auto-removed' not in item for item in check_fail_list) else ""),
                 inline=True
             )
         else:
@@ -354,6 +393,62 @@ class Control(commands.Cog):
             await message.edit(embed=embed)
         self.logger.info(f"{alliance_name} Alliance Control completed at {end_time.strftime('%Y-%m-%d %H:%M:%S')}")
         self.logger.info(f"{alliance_name} Alliance Total Duration: {duration}")
+        
+        # Update ephemeral message at completion if provided
+        if interaction_message:
+            try:
+                changes_detected = bool(furnace_changes or nickname_changes or kid_changes or check_fail_list)
+                
+                if is_batch and batch_info:
+                    # Check if this is the last alliance in the batch
+                    if batch_info['current'] == batch_info['total']:
+                        # Final completion message for all alliances
+                        status_embed = discord.Embed(
+                            title="✅ Alliance Control Complete",
+                            description=(
+                                "━━━━━━━━━━━━━━━━━━━━━━\n"
+                                f"📊 **Type:** All Alliances ({batch_info['total']} total)\n"
+                                f"🏰 **Alliances:** {batch_info['total']} processed\n"
+                                f"✅ **Status:** Completed\n"
+                                f"📈 **Latest Alliance:** {alliance_name}\n"
+                                f"⏱️ **Duration:** {duration.total_seconds():.1f} seconds\n"
+                                "━━━━━━━━━━━━━━━━━━━━━━"
+                            ),
+                            color=discord.Color.green()
+                        )
+                    else:
+                        # Still processing other alliances - just update progress
+                        status_embed = discord.Embed(
+                            title="🔄 Alliance Control Operation",
+                            description=(
+                                "━━━━━━━━━━━━━━━━━━━━━━\n"
+                                f"📊 **Type:** All Alliances ({batch_info['total']} total)\n"
+                                f"🏰 **Completed:** {alliance_name}\n"
+                                f"📍 **Progress:** {batch_info['current']}/{batch_info['total']} alliances\n"
+                                f"📈 **Changes in {alliance_name}:** {'Yes' if changes_detected else 'No'}\n"
+                                "━━━━━━━━━━━━━━━━━━━━━━"
+                            ),
+                            color=discord.Color.blue()
+                        )
+                else:
+                    # Single alliance completion
+                    status_embed = discord.Embed(
+                        title="✅ Alliance Control Complete",
+                        description=(
+                            "━━━━━━━━━━━━━━━━━━━━━━\n"
+                            f"📊 **Type:** Single Alliance\n"
+                            f"🏰 **Alliance:** {alliance_name}\n"
+                            f"✅ **Status:** Completed\n"
+                            f"📈 **Changes Detected:** {'Yes' if changes_detected else 'No'}\n"
+                            f"⏱️ **Duration:** {duration.total_seconds():.1f} seconds\n"
+                            "━━━━━━━━━━━━━━━━━━━━━━"
+                        ),
+                        color=discord.Color.green()
+                    )
+                
+                await interaction_message.edit(embed=status_embed)
+            except Exception as e:
+                self.logger.warning(f"Could not update interaction message at completion: {e}")
 
     async def send_embed(self, channel, title, description, color, footer):
         if isinstance(description, str):
@@ -418,8 +513,8 @@ class Control(commands.Cog):
 
                     await self.login_handler.queue_operation({
                         'type': 'alliance_control',
-                        'callback': lambda ch=channel, aid=alliance_id: self.check_agslist(ch, aid),
-                        'description': f'Control check for alliance {alliance_id}',
+                        'callback': lambda ch=channel, aid=alliance_id: self.check_agslist(ch, aid, interaction_message=None),
+                        'description': f'Scheduled control check for alliance {alliance_id}',
                         'alliance_id': alliance_id
                     })
                     
@@ -502,8 +597,6 @@ class Control(commands.Cog):
     @tasks.loop(minutes=1)
     async def monitor_alliance_changes(self):
         try:
-            current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
             async with self.db_lock:
                 self.cursor_alliance.execute("SELECT alliance_id, channel_id, interval FROM alliancesettings")
                 current_settings = {
